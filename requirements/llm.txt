@@ -1,0 +1,3 @@
+# The Ollama validation path uses Python stdlib HTTP calls.
+# Install Ollama separately from https://ollama.com/.
+
