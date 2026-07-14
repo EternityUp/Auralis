@@ -2,23 +2,49 @@
 
 This document records the next implementation plan after the offline single-turn pipeline and persistent non-streaming runtime have been validated.
 
-## Current Baseline
+## Validation Status: Milestone 02 Complete
 
-The current stable baseline is:
+As of 2026-07-14, the first live streaming, half-duplex interaction loop has been validated across the Windows client and Linux server:
+
+```text
+Windows mic
+-> channel 0 -> continuous 16 kHz mono PCM16 WebSocket frames
+-> Silero VAD endpointing
+-> sherpa-onnx SenseVoice ASR
+-> Ollama qwen3:8b with four-turn history
+-> persistent CosyVoice SFT
+-> reply WAV WebSocket transfer
+-> Windows speaker playback
+```
+
+Validated details:
+
+- 48 kHz Windows microphone capture is resampled continuously to 16 kHz before VAD and ASR.
+- Silero VAD was selected as the current default after comparison with FunASR FSMN-VAD and WebRTC VAD.
+- Noise-like ASR results are filtered before reaching the LLM.
+- The client and server exchange `turn_started`, `utterance_saved`, `asr_result`, `llm_result`, `tts_result`, and `reply_audio` events for each valid turn.
+- The tested CosyVoice SFT synthesis time was approximately 4.8 to 4.9 seconds per short reply; ASR and LLM were both below one second in the observed turns.
+- The client uses a half-duplex policy: it closes the capture stream once the server accepts an utterance, plays the reply on the main Windows thread, then reopens capture.
+
+This is live frame streaming with utterance-level ASR, LLM, and TTS. It is not yet token-level or audio-chunk-level streaming.
+
+## Current Baselines
+
+The retained offline regression baseline is:
 
 ```text
 input wav/text -> ASR -> LLM -> TTS -> output wav
 ```
 
-`auralis_lab/runtime.py` keeps ASR, LLM, and TTS available in one process and reduces repeated interaction latency. Keep it as the non-streaming baseline.
+`auralis_lab/runtime.py` keeps ASR, LLM, and TTS available in one process and reduces repeated interaction latency. Keep it for non-streaming regression tests.
 
-The next runtime should be implemented in a new file, for example:
+The validated live runtime is:
 
 ```text
-auralis_lab/streaming_runtime.py
+auralis_lab/ws_stream_tts_server.py
 ```
 
-Do not replace the current `runtime.py` until the streaming path is stable.
+It runs the server-side VAD, ASR, LLM, and TTS stages while `auralis_client/stream_upload_client.py` handles Windows capture and playback. Do not replace `runtime.py`; the two scripts validate different interaction modes.
 
 ## Target Interaction Shape
 
@@ -121,13 +147,32 @@ Candidate VAD engines:
 - `silero-vad`
 - `webrtcvad`
 
-Initial recommendation:
+Current selection:
 
-Use either FunASR `fsmn-vad` or `silero-vad` first. Keep the VAD module independent from ASR so that the ASR default can remain `sherpa_onnx + SenseVoice` while VAD can be chosen separately.
+Use `silero-vad` as the current default. It had the best overall endpointing behavior in the local comparison; WebRTC VAD produced more false positives, while FunASR FSMN-VAD produced occasional false triggers. Keep the VAD module independent from ASR so that the ASR default remains `sherpa_onnx + SenseVoice` and the VAD can still be switched for later regression tests.
 
 ## Runtime Architecture
 
-The first streaming runtime should use threads and queues, not multiple processes.
+### Current Cross-Machine Implementation
+
+The validated deployment is split across the two projects:
+
+```text
+Windows AuralisClient
+  sounddevice capture callback -> 16 kHz PCM16 frames -> WebSocket
+
+Linux Auralis server
+  asyncio WebSocket handler -> VAD -> ASR -> LLM -> persistent TTS -> reply WAV
+
+Windows AuralisClient
+  receive reply WAV -> main-thread WASAPI playback -> reopen capture
+```
+
+The current server processes one endpointed utterance at a time per connection. This is intentional for the half-duplex MVP.
+
+### Future In-Process Architecture
+
+For a future single-machine runtime, use threads and queues before considering multiple processes.
 
 Recommended architecture:
 
@@ -254,6 +299,112 @@ Windows client -> WebSocket -> Linux server
 ping -> pong
 ```
 
+### Step 4: Streaming Frame Upload Test
+
+Goal:
+
+```text
+Windows client mic
+-> channel 0
+-> 16 kHz mono PCM16 frames
+-> WebSocket binary messages
+-> Linux server reconstructs wav
+```
+
+Server command:
+
+```bash
+cd /home/xiezc/Auralis
+python auralis_lab/ws_stream_record_server.py --host 0.0.0.0 --port 8766
+```
+
+Client command:
+
+```powershell
+python -m auralis_client.stream_upload_client --input-device 26 --server-url ws://192.168.16.206:8766 --seconds 10 --frame-ms 100 --blocksize-frames 0
+```
+
+### Step 5: Streaming VAD Endpoint Test
+
+Goal:
+
+```text
+continuous PCM16 stream
+-> VAD speech start/end detection
+-> save each detected utterance as wav
+```
+
+Server command with the lightweight energy fallback:
+
+```bash
+python auralis_lab/ws_stream_vad_server.py --host 0.0.0.0 --port 8767 --vad-engine energy
+```
+
+Server command with FunASR FSMN-VAD selected:
+
+```bash
+python auralis_lab/ws_stream_vad_server.py --host 0.0.0.0 --port 8767 --vad-engine funasr_fsmn
+```
+
+Server command with Silero VAD selected:
+
+```bash
+python auralis_lab/ws_stream_vad_server.py --host 0.0.0.0 --port 8767 --vad-engine silero
+```
+
+Server command with WebRTC VAD selected:
+
+```bash
+python auralis_lab/ws_stream_vad_server.py --host 0.0.0.0 --port 8767 --vad-engine webrtc --webrtc-aggressiveness 2
+```
+
+VAD model files should be stored under the project `models/vad` directory:
+
+```text
+models/vad/funasr-fsmn-vad
+models/vad/silero-vad
+```
+
+Download FunASR FSMN-VAD:
+
+```bash
+modelscope download --model iic/speech_fsmn_vad_zh-cn-16k-common-pytorch --local_dir models/vad/funasr-fsmn-vad
+```
+
+Download Silero VAD:
+
+```bash
+git clone https://github.com/snakers4/silero-vad models/vad/silero-vad
+```
+
+WebRTC VAD has no model file. Install the Python dependency:
+
+```bash
+python -m pip install webrtcvad
+```
+
+Client command:
+
+```powershell
+python -m auralis_client.stream_upload_client --input-device 26 --server-url ws://192.168.16.206:8767 --seconds 30 --frame-ms 100 --blocksize-frames 0
+```
+
+Detected utterance wav files are saved under:
+
+```text
+outputs/ws_stream_utterances/
+```
+
+Tune these values first when endpointing is too eager or too slow:
+
+```text
+--energy-threshold
+--speech-start-ms
+--speech-end-ms
+--pre-speech-ms
+--min-utterance-ms
+```
+
 Minimal server command:
 
 ```bash
@@ -264,7 +415,7 @@ python auralis_lab/ws_ping_server.py --host 0.0.0.0 --port 8765
 
 The server must bind to `0.0.0.0`, not `127.0.0.1`, so that the Windows client can connect over the LAN.
 
-### Step 4: VAD Utterance Segmentation
+### Legacy Offline WebSocket Validation
 
 Before VAD, validate that the Windows client can upload a complete 16 kHz mono wav to the server:
 
@@ -296,7 +447,7 @@ python auralis_lab/ws_pipeline_server.py --host 0.0.0.0 --port 8765
 
 This WebSocket pipeline server keeps ASR and TTS loaded persistently after startup. This avoids reloading sherpa-onnx and CosyVoice on every client turn.
 
-Goal:
+Historical next full streaming goal, now validated by Milestone 02:
 
 ```text
 live 16 kHz mono audio -> VAD -> complete utterance wav
@@ -308,41 +459,110 @@ Validation:
 - speech start/end are stable enough in a normal room
 - silence and background noise do not trigger too many false utterances
 
-### Step 5: Live ASR
+### Step 6: Streaming VAD + ASR
 
 Goal:
 
 ```text
-mic -> VAD -> ASR_TEXT
+continuous PCM16 stream
+-> VAD speech start/end detection
+-> save utterance wav
+-> ASR transcription
+-> send ASR text event back to client
 ```
 
-Validation:
+Server command:
 
-- every detected utterance is transcribed
-- ASR text is printed in the terminal
-- default ASR can start with `sherpa_onnx + SenseVoice`
+```bash
+python auralis_lab/ws_stream_asr_server.py --host 0.0.0.0 --port 8768 --vad-engine silero --asr-engine sherpa_onnx
+```
 
-### Step 6: Live ASR + LLM
+Alternative VAD engines:
+
+```bash
+python auralis_lab/ws_stream_asr_server.py --host 0.0.0.0 --port 8768 --vad-engine webrtc --asr-engine sherpa_onnx
+python auralis_lab/ws_stream_asr_server.py --host 0.0.0.0 --port 8768 --vad-engine funasr_fsmn --asr-engine sherpa_onnx
+```
+
+Client command:
+
+```powershell
+python -m auralis_client.stream_upload_client --input-device 26 --server-url ws://192.168.16.206:8768 --seconds 60 --frame-ms 100 --blocksize-frames 0
+```
+
+The client prints `utterance_saved`, `asr_result`, and `asr_filtered` server events. `asr_filtered` means the utterance wav was saved, but the ASR text was considered noise-like and should not enter later LLM/TTS stages.
+
+Useful ASR post-filter parameters:
+
+```text
+--min-asr-text-chars
+--min-asr-duration-seconds
+--asr-noise-phrases
+--keep-empty-asr
+```
+
+### Step 7: Streaming VAD + ASR + LLM
 
 Goal:
 
 ```text
-mic -> VAD -> ASR -> LLM_TEXT
+continuous PCM16 stream
+-> VAD utterance segmentation
+-> ASR text and post-filtering
+-> Ollama / Qwen3 reply
+-> send LLM text event back to client
 ```
+
+Server command:
+
+```bash
+python auralis_lab/ws_stream_llm_server.py --host 0.0.0.0 --port 8769 --vad-engine silero --asr-engine sherpa_onnx --llm-model qwen3:8b
+```
+
+Client command:
+
+```powershell
+python -m auralis_client.stream_upload_client --input-device 26 --server-url ws://192.168.16.206:8769 --seconds 90 --frame-ms 100 --blocksize-frames 0 --timeout 180
+```
+
+Each WebSocket connection keeps the most recent four user/assistant turns by default. Set `--max-history-turns 0` for independent single-turn replies.
 
 Validation:
 
 - LLM reply is concise
 - no `<think>` content appears
-- response is suitable for speech synthesis
+- `asr_filtered` never produces `llm_result`
+- `llm_result` includes the response latency and history size
+- without an external data source, LLM replies do not claim real-time weather, traffic, price, news, or similar facts
 
-### Step 7: Full Live Voice Loop
+### Step 8: Streaming VAD + ASR + LLM + TTS
 
 Goal:
 
 ```text
-mic -> VAD -> ASR -> LLM -> TTS -> speaker
+continuous PCM16 stream
+-> VAD utterance segmentation
+-> ASR and LLM
+-> persistent CosyVoice synthesis
+-> reply WAV over WebSocket
+-> client speaker playback
 ```
+
+Server command:
+
+```bash
+cd /home/xiezc/Auralis
+export PYTHONPATH=/home/xiezc/Auralis/third_party/CosyVoice:$PYTHONPATH
+CUDA_VISIBLE_DEVICES=7 python auralis_lab/ws_stream_tts_server.py --host 0.0.0.0 --port 8770 --vad-engine silero --asr-engine sherpa_onnx --llm-model qwen3:8b --tts-engine cosyvoice --cosy-mode sft
+```
+
+Client command:
+
+```powershell
+python -m auralis_client.stream_upload_client --input-device 26 --output-device 23 --server-url ws://192.168.16.206:8770 --seconds 90 --frame-ms 100 --blocksize-frames 0 --timeout 300
+```
+
+The server emits `turn_started`, `utterance_saved`, `asr_result`, `llm_result`, `tts_result`, and `reply_audio` events. The client saves received reply WAV files under `outputs/stream_replies/`. When `--output-device` is set, it closes microphone capture as soon as `turn_started` arrives and reopens it after playback; this prevents feedback and avoids queuing microphone frames while the server runs LLM/TTS. Reply playback is created on the main Windows thread for WASAPI compatibility. Omit `CUDA_VISIBLE_DEVICES=7` when another GPU should run CosyVoice.
 
 Validation:
 
@@ -351,7 +571,7 @@ Validation:
 - latency is measured per stage
 - system can handle multiple turns
 
-### Step 8: Playback and Barge-In Policy
+### Step 9: Playback and Barge-In Policy
 
 Questions to resolve:
 
@@ -360,11 +580,11 @@ Questions to resolve:
 - Should the user be allowed to interrupt TTS playback?
 - Is echo cancellation required?
 
-Initial recommendation:
+Implemented baseline:
 
-For the first version, pause or ignore user input during TTS playback. Add barge-in later.
+The client closes capture after `turn_started`, ignores input during reply generation and playback, and reopens capture after playback. Add barge-in later.
 
-### Step 9: Performance Optimization
+### Step 10: Performance Optimization
 
 Optimize after the full live loop works.
 
@@ -379,14 +599,9 @@ Potential directions:
 
 ## Recommended Next Action
 
-Start with audio I/O only:
+Milestone 02 now has a working utterance-level live loop. Optimize and extend from this stable baseline in this order:
 
-```text
-device enumeration
--> mic selection
--> speaker selection
--> record 3 seconds as 16 kHz mono wav
--> play a wav through selected speaker
-```
-
-This isolates the most important new dependency: real hardware audio I/O. Once this is stable, add VAD.
+1. Record per-turn latency from VAD endpoint through playback start, then reduce TTS response time and constrain reply length.
+2. Add explicit playback state and a user-visible stop command, while retaining the current half-duplex policy.
+3. Introduce streaming ASR partial results, then chunked/streaming TTS playback only after the endpointed baseline remains stable.
+4. Add echo cancellation and barge-in only when the product requires open-speaker interaction.

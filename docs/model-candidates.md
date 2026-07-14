@@ -1,5 +1,7 @@
 # Model Candidates
 
+> Status: this is the initial candidate list. The current validated live default is `sherpa_onnx + SenseVoice -> qwen3:8b -> CosyVoice SFT`, with Silero VAD. Other entries remain useful for offline comparison and regression testing.
+
 This document tracks the first model candidates for independent validation.
 
 ## ASR First

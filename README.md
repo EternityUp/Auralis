@@ -16,11 +16,11 @@ audio -> ASR -> LLM -> TTS -> speaker
 
 ## Audio Standard
 
-Auralis uses a 16 kHz audio flow end to end.
+Auralis standardizes the capture, VAD, and ASR path on 16 kHz mono audio.
 
-- Input audio should be converted to 16 kHz mono before ASR.
+- Input audio should be converted to 16 kHz mono before VAD and ASR.
 - Microphone-array frontend modules should output 16 kHz mono audio.
-- TTS output may be generated at a model-native rate, but playback or downstream processing should convert it when needed.
+- TTS output remains at the model-native rate and is converted only when the selected playback device requires it.
 
 ## Environment
 

@@ -1,5 +1,7 @@
 # Validation Plan
 
+> Status: the independent model checks and offline pipeline in this plan have been completed. The current validated live stack is Silero VAD, sherpa-onnx SenseVoice, Ollama `qwen3:8b`, and CosyVoice SFT; see `streaming-runtime-plan.md` for the active runtime path. Keep this document as the repeatable model and offline regression checklist.
+
 ## Goal
 
 Validate ASR, TTS, and LLM independently before building the full voice interaction pipeline.
