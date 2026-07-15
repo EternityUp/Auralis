@@ -24,7 +24,7 @@ Validated details:
 - Noise-like ASR results are filtered before reaching the LLM.
 - The client and server exchange `turn_started`, `utterance_saved`, `asr_result`, `llm_result`, `tts_result`, and `reply_audio` events for each valid turn.
 - The tested CosyVoice SFT synthesis time was approximately 4.8 to 4.9 seconds per short reply; ASR and LLM were both below one second in the observed turns.
-- The client uses a half-duplex policy: it closes the capture stream once the server accepts an utterance, plays the reply on the main Windows thread, then reopens capture.
+- The previously validated loop used a logical half-duplex policy. The HP21 single-WASAPI-Stream hardware test has now passed; the client integration keeps that Stream open and pauses only upstream frame delivery during a reply. Its server-backed regression test is the next validation step.
 
 This is live frame streaming with utterance-level ASR, LLM, and TTS. It is not yet token-level or audio-chunk-level streaming.
 
@@ -562,7 +562,7 @@ Client command:
 python -m auralis_client.stream_upload_client --input-device 26 --output-device 23 --server-url ws://192.168.16.206:8770 --seconds 90 --frame-ms 100 --blocksize-frames 0 --timeout 300
 ```
 
-The server emits `turn_started`, `utterance_saved`, `asr_result`, `llm_result`, `tts_result`, and `reply_audio` events. The client saves received reply WAV files under `outputs/stream_replies/`. When `--output-device` is set, it closes microphone capture as soon as `turn_started` arrives and reopens it after playback; this prevents feedback and avoids queuing microphone frames while the server runs LLM/TTS. Reply playback is created on the main Windows thread for WASAPI compatibility. Omit `CUDA_VISIBLE_DEVICES=7` when another GPU should run CosyVoice.
+The server emits `turn_started`, `utterance_saved`, `asr_result`, `llm_result`, `tts_result`, and `reply_audio` events. The client saves received reply WAV files under `outputs/stream_replies/`. When `--output-device` is set, it pauses upstream microphone frames as soon as `turn_started` arrives and resumes them after playback; this prevents feedback and avoids queuing microphone frames while the server runs LLM/TTS. On a WASAPI input/output pair, `--audio-mode auto` keeps one duplex Stream open throughout the session. Omit `CUDA_VISIBLE_DEVICES=7` when another GPU should run CosyVoice.
 
 Validation:
 
