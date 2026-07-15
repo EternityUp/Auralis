@@ -2,7 +2,7 @@
 
 This document records the next implementation plan after the offline single-turn pipeline and persistent non-streaming runtime have been validated.
 
-## Validation Status: Milestone 02 Complete
+## Validation Status: Milestones 02 and 03 Complete
 
 As of 2026-07-14, the first live streaming, half-duplex interaction loop has been validated across the Windows client and Linux server:
 
@@ -24,7 +24,8 @@ Validated details:
 - Noise-like ASR results are filtered before reaching the LLM.
 - The client and server exchange `turn_started`, `utterance_saved`, `asr_result`, `llm_result`, `tts_result`, and `reply_audio` events for each valid turn.
 - The tested CosyVoice SFT synthesis time was approximately 4.8 to 4.9 seconds per short reply; ASR and LLM were both below one second in the observed turns.
-- The previously validated loop used a logical half-duplex policy. The HP21 single-WASAPI-Stream hardware test has now passed; the client integration keeps that Stream open and pauses only upstream frame delivery during a reply. Its server-backed regression test is the next validation step.
+- The Milestone 02 loop uses a logical half-duplex policy. Its HP21 single-WASAPI-Stream integration has passed cross-machine validation: the Stream remains open while only upstream delivery is paused during reply processing and playback.
+- Milestone 03 has also passed with continuous upstream frames during playback, Silero endpointing, ASR filtering, and LLM-confirmed barge-in. Acknowledgements continue playback; directed stop commands or new requests clear it.
 
 This is live frame streaming with utterance-level ASR, LLM, and TTS. It is not yet token-level or audio-chunk-level streaming.
 
@@ -38,13 +39,21 @@ input wav/text -> ASR -> LLM -> TTS -> output wav
 
 `auralis_lab/runtime.py` keeps ASR, LLM, and TTS available in one process and reduces repeated interaction latency. Keep it for non-streaming regression tests.
 
-The validated live runtime is:
+The retained half-duplex live runtime is:
 
 ```text
 auralis_lab/ws_stream_tts_server.py
 ```
 
 It runs the server-side VAD, ASR, LLM, and TTS stages while `auralis_client/stream_upload_client.py` handles Windows capture and playback. Do not replace `runtime.py`; the two scripts validate different interaction modes.
+
+The validated continuous-uplink runtime is:
+
+```text
+auralis_lab/ws_realtime_bargein_server.py
+```
+
+It works with `auralis_client/realtime_bargein_client.py` and uses a semantic interruption decision rather than stopping audio on a raw VAD trigger.
 
 ## Target Interaction Shape
 
@@ -153,22 +162,36 @@ Use `silero-vad` as the current default. It had the best overall endpointing beh
 
 ## Runtime Architecture
 
-### Current Cross-Machine Implementation
+### Current Cross-Machine Implementations
 
 The validated deployment is split across the two projects:
 
 ```text
+Milestone 02 retained baseline:
+
 Windows AuralisClient
-  sounddevice capture callback -> 16 kHz PCM16 frames -> WebSocket
+  one WASAPI duplex Stream -> 16 kHz PCM16 frames -> WebSocket
 
 Linux Auralis server
-  asyncio WebSocket handler -> VAD -> ASR -> LLM -> persistent TTS -> reply WAV
+  VAD -> ASR -> LLM -> persistent TTS -> reply WAV
 
 Windows AuralisClient
-  receive reply WAV -> main-thread WASAPI playback -> reopen capture
+  receive reply WAV -> playback through the still-open duplex Stream
+
+Milestone 03 validated realtime path:
+
+Windows AuralisClient
+  one WASAPI duplex Stream -> continuous 16 kHz PCM16 frames -> WebSocket
+
+Linux Auralis server
+  VAD endpoint -> ASR/noise filter -> while playing, LLM classifier -> interrupt/continue/ignore
+  normal turn -> LLM -> persistent TTS -> reply WAV
+
+Windows AuralisClient
+  queue reply WAV through the same duplex Stream -> clear active/queued playback on `barge_in`
 ```
 
-The current server processes one endpointed utterance at a time per connection. This is intentional for the half-duplex MVP.
+The half-duplex server processes one endpointed utterance at a time per connection. The realtime server accepts continuous frames and uses background tasks for utterance processing, while ASR and LLM model access remains serialized with locks.
 
 ### Future In-Process Architecture
 
@@ -571,18 +594,31 @@ Validation:
 - latency is measured per stage
 - system can handle multiple turns
 
-### Step 9: Playback and Barge-In Policy
+### Step 9: Realtime Barge-In (Validated)
 
-Questions to resolve:
+The validated half-duplex loop remains unchanged. A separate server and continuous-uplink WASAPI client provide the validated realtime path:
 
-- Should microphone capture pause during TTS playback?
-- Should VAD ignore audio while the system is speaking?
-- Should the user be allowed to interrupt TTS playback?
-- Is echo cancellation required?
+```text
+continuous microphone frames while the assistant is active
+-> VAD endpoint
+-> ASR and existing noise filters
+-> short LLM interruption classifier
+-> barge_in only when the result is interrupt
+```
 
-Implemented baseline:
+This intentionally does not stop playback on VAD alone. The classifier returns `interrupt`, `continue`, or `ignore`; short explicit stop commands remain valid interrupts, while acknowledgements and noise should keep the reply playing.
 
-The client closes capture after `turn_started`, ignores input during reply generation and playback, and reopens capture after playback. Add barge-in later.
+Server command:
+
+```bash
+cd /home/xiezc/Auralis
+export PYTHONPATH=/home/xiezc/Auralis/third_party/CosyVoice:$PYTHONPATH
+CUDA_VISIBLE_DEVICES=7 python auralis_lab/ws_realtime_bargein_server.py --host 0.0.0.0 --port 8771 --vad-engine silero --asr-engine sherpa_onnx --llm-model qwen3:8b --tts-engine cosyvoice --cosy-mode sft
+```
+
+The client must use the separate `realtime_bargein_client.py` and an already validated HP21 WASAPI duplex device pair.
+
+Validation confirmed that acknowledgements are classified as `continue`, while directed stop commands and new requests are classified as `interrupt` and clear local playback. The client keeps sending 16 kHz PCM16 frames during playback. At normal client duration expiry it drains any reply WAV already received; `Ctrl+C` remains immediate stop.
 
 ### Step 10: Performance Optimization
 
@@ -599,9 +635,9 @@ Potential directions:
 
 ## Recommended Next Action
 
-Milestone 02 now has a working utterance-level live loop. Optimize and extend from this stable baseline in this order:
+Milestones 02 and 03 now provide working utterance-level live loops. Optimize and extend from this stable baseline in this order:
 
 1. Record per-turn latency from VAD endpoint through playback start, then reduce TTS response time and constrain reply length.
-2. Add explicit playback state and a user-visible stop command, while retaining the current half-duplex policy.
-3. Introduce streaming ASR partial results, then chunked/streaming TTS playback only after the endpointed baseline remains stable.
-4. Add echo cancellation and barge-in only when the product requires open-speaker interaction.
+2. Profile and improve stale-work handling so an interrupted synchronous TTS task consumes as little unnecessary GPU time as possible.
+3. Introduce streaming ASR partial results, then chunked or streaming TTS playback only after the endpointed baseline remains stable.
+4. Evaluate speaker-mode behavior with the HP21 hardware AEC and test barge-in thresholds in realistic noisy conditions.
